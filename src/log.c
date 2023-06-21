@@ -43,6 +43,7 @@
 #include <haproxy/stream.h>
 #include <haproxy/time.h>
 #include <haproxy/tools.h>
+#include <systemd/sd-journal.h>
 
 /* global recv logs counter */
 int cum_log_messages;
@@ -1627,61 +1628,72 @@ struct ist *build_log_header(enum log_fmt format, int level, int facility,
  */
 static inline void __do_send_log(struct logsrv *logsrv, int nblogger, int level, int facility, struct ist *metadata, char *message, size_t size)
 {
-	static THREAD_LOCAL struct iovec iovec[NB_LOG_HDR_MAX_ELEMENTS+1+1] = { }; /* header elements + message + LF */
-	static THREAD_LOCAL struct msghdr msghdr = {
-		//.msg_iov = iovec,
-		.msg_iovlen = NB_LOG_HDR_MAX_ELEMENTS+2
-	};
-	static THREAD_LOCAL int logfdunix = -1;	/* syslog to AF_UNIX socket */
-	static THREAD_LOCAL int logfdinet = -1;	/* syslog to AF_INET socket */
-	int *plogfd;
-	int sent;
-	size_t nbelem;
-	struct ist *msg_header = NULL;
-
-	msghdr.msg_iov = iovec;
+	static THREAD_LOCAL struct iovec iovec[NB_LOG_HDR_MAX_ELEMENTS + 1 + 1] = {}; /* header elements + message + LF */
+    static THREAD_LOCAL struct msghdr msghdr = {
+        .msg_iov = iovec,
+        .msg_iovlen = NB_LOG_HDR_MAX_ELEMENTS + 2
+    };
+    static THREAD_LOCAL int logfdunix = -1; /* syslog to AF_UNIX socket */
+    static THREAD_LOCAL int logfdinet = -1; /* syslog to AF_INET socket */
+    int *plogfd;
+    int sent;
+    size_t nbelem;
+    struct ist *msg_header = NULL;
 
 	/* historically some messages used to already contain the trailing LF
 	 * or Zero. Let's remove all trailing LF or Zero
 	 */
-	while (size && (message[size-1] == '\n' || (message[size-1] == 0)))
-		size--;
+	while (size && (message[size - 1] == '\n' || (message[size - 1] == 0)))
+        size--;
 
-	if (logsrv->type == LOG_TARGET_BUFFER) {
-		plogfd = NULL;
-		goto send;
-	}
+    if (logsrv->type == LOG_TARGET_BUFFER) {
+        plogfd = NULL;
+        goto send;
+    }
 	else if (logsrv->addr.ss_family == AF_CUST_EXISTING_FD) {
 		/* the socket's address is a file descriptor */
 		plogfd = (int *)&((struct sockaddr_in *)&logsrv->addr)->sin_addr.s_addr;
 	}
 	else if (logsrv->addr.ss_family == AF_UNIX)
 		plogfd = &logfdunix;
-	else
-		plogfd = &logfdinet;
+    else
+        plogfd = &logfdinet;
 
-	if (plogfd && unlikely(*plogfd < 0)) {
-		/* socket not successfully initialized yet */
-		if ((*plogfd = socket(logsrv->addr.ss_family, SOCK_DGRAM,
-							  (logsrv->addr.ss_family == AF_UNIX) ? 0 : IPPROTO_UDP)) < 0) {
-			static char once;
+    if (plogfd && unlikely(*plogfd < 0)) {
+        /* socket not successfully initialized yet */
+        if ((*plogfd = socket(logsrv->addr.ss_family, SOCK_DGRAM,
+            (logsrv->addr.ss_family == AF_UNIX) ? 0 : IPPROTO_UDP)) < 0) {
+            static char once;
 
-			if (!once) {
-				once = 1; /* note: no need for atomic ops here */
-				ha_alert("socket() failed in logger #%d: %s (errno=%d)\n",
-						 nblogger, strerror(errno), errno);
-			}
-			return;
-		} else {
-			/* we don't want to receive anything on this socket */
-			setsockopt(*plogfd, SOL_SOCKET, SO_RCVBUF, &zero, sizeof(zero));
-			/* does nothing under Linux, maybe needed for others */
-			shutdown(*plogfd, SHUT_RD);
-			fd_set_cloexec(*plogfd);
-		}
-	}
+            if (!once) {
+                once = 1; /* note: no need for atomic ops here */
+                ha_alert("socket() failed in logger #%d: %s (errno=%d)\n",
+                    nblogger, strerror(errno), errno);
+            }
+            return;
+        }
+        else {
+            /* we don't want to receive anything on this socket */
+            setsockopt(*plogfd, SOL_SOCKET, SO_RCVBUF, &zero, sizeof(zero));
+            /* does nothing under Linux, maybe needed for others */
+            shutdown(*plogfd, SHUT_RD);
+            fd_set_cloexec(*plogfd);
+        }
+    }
 
-	msg_header = build_log_header(logsrv->format, level, facility, metadata, &nbelem);
+    msg_header = build_log_header(logsrv->format, level, facility, metadata, &nbelem);
+
+    if (logsrv->type == LOG_TARGET_JOURNALD) {
+        struct ist msg;
+
+        msg = ist2(message, size);
+        msg = isttrim(msg, logsrv->maxlen);
+
+        sd_journal_sendv(metadata, msg_header, nbelem, "MESSAGE=%.*s", (int)size, message, NULL);
+
+        return;
+    }
+
  send:
 	if (logsrv->type == LOG_TARGET_BUFFER) {
 		struct ist msg;
